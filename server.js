@@ -1,5 +1,5 @@
-// GHOSTSTEIN Aviator - Bulletproof Backend
-// Protection against spam, double-clicks, and duplicate requests
+// GHOSTSTEIN Aviator - Bulletproof Backend v2.1
+// Fixes: stuck active-bet state, crash reporting endpoint
 
 const express = require('express');
 const cors = require('cors');
@@ -13,29 +13,23 @@ const PORT = process.env.PORT || 3000;
 // ============================================
 // STORAGE
 // ============================================
-const users    = new Map(); // userId → user object
-const games    = new Map(); // gameId → game object
+const users       = new Map(); // userId → user object
+const games       = new Map(); // gameId → game object
 const activeGames = new Map(); // userId → gameId (only ONE per user!)
 
 // ============================================
-// RATE LIMITER (no extra package needed!)
+// RATE LIMITER
 // ============================================
-const requestLog = new Map(); // userId → { count, resetAt }
+const requestLog = new Map();
 
 function isRateLimited(userId, maxPerMinute = 30) {
   const now = Date.now();
   const entry = requestLog.get(userId);
-
   if (!entry || now > entry.resetAt) {
-    // Fresh window
     requestLog.set(userId, { count: 1, resetAt: now + 60000 });
     return false;
   }
-
-  if (entry.count >= maxPerMinute) {
-    return true; // Too many requests!
-  }
-
+  if (entry.count >= maxPerMinute) return true;
   entry.count++;
   return false;
 }
@@ -51,14 +45,14 @@ function getUser(userId) {
       gamesPlayed: 0,
       totalWon: 0,
       totalWagered: 0,
-      lastGameAt: 0,   // timestamp of last game start
+      lastGameAt: 0,
     });
   }
   return users.get(userId);
 }
 
 // ============================================
-// CRASH POINT GENERATOR (fair + capped at 20x)
+// CRASH POINT GENERATOR (capped at 20x)
 // ============================================
 function generateCrashPoint() {
   const r = Math.random();
@@ -73,9 +67,8 @@ function generateCrashPoint() {
 // ROUTES
 // ============================================
 
-// Health check
 app.get('/', (req, res) => {
-  res.json({ name: 'GHOSTSTEIN Aviator', status: 'online', version: '2.0' });
+  res.json({ name: 'GHOSTSTEIN Aviator', status: 'online', version: '2.1' });
 });
 
 app.get('/api/health', (req, res) => {
@@ -99,17 +92,14 @@ app.get('/api/user/:userId', (req, res) => {
   });
 });
 
-// ── DEPOSIT (for testing - in prod verify blockchain tx) ──
+// ── DEPOSIT ───────────────────────────────────
 app.post('/api/deposit', (req, res) => {
   const { userId, amount } = req.body;
-
   if (!userId || !amount || amount <= 0) {
     return res.status(400).json({ success: false, error: 'Invalid request' });
   }
-
   const user = getUser(userId);
   user.balance += parseFloat(amount);
-
   res.json({ success: true, balance: user.balance });
 });
 
@@ -117,51 +107,50 @@ app.post('/api/deposit', (req, res) => {
 app.post('/api/game/start', (req, res) => {
   const { userId, betAmount } = req.body;
 
-  // ── Validate input
   if (!userId || !betAmount || betAmount <= 0) {
     return res.status(400).json({ success: false, error: 'Invalid request' });
   }
 
   const bet = parseFloat(betAmount);
 
-  // ── Rate limit check (max 10 game starts per minute)
   if (isRateLimited(userId, 10)) {
-    return res.status(429).json({
-      success: false,
-      error: 'Too many requests! Slow down.'
-    });
+    return res.status(429).json({ success: false, error: 'Too many requests! Slow down.' });
   }
 
   const user = getUser(userId);
 
-  // ── Check if user ALREADY has an active game
-  // This is the KEY protection against double-click spam!
+  // ── Check for stuck active game and auto-clear it
   if (activeGames.has(userId)) {
     const existingGameId = activeGames.get(userId);
-    const existingGame = games.get(existingGameId);
+    const existingGame   = games.get(existingGameId);
 
-    // If game is still active, block new game
     if (existingGame && existingGame.status === 'active') {
-      return res.status(400).json({
-        success: false,
-        error: 'You already have an active game! Cash out first.'
-      });
+      // ✅ FIX: Auto-resolve stuck games older than 60 seconds
+      const age = Date.now() - existingGame.startedAt;
+      if (age > 60000) {
+        // Game is stale — treat as crashed, refund bet, clear state
+        existingGame.status = 'crashed';
+        user.balance += existingGame.betAmount;
+        activeGames.delete(userId);
+        console.log(`♻️ Auto-cleared stale game for ${userId}, refunded ${existingGame.betAmount}`);
+      } else {
+        return res.status(400).json({
+          success: false,
+          error: 'You already have an active game! Cash out first.'
+        });
+      }
     } else {
-      // Game ended somehow, clean up
       activeGames.delete(userId);
     }
   }
 
-  // ── Cooldown: min 1 second between game starts
+  // ── Cooldown: 1 second between game starts
   const now = Date.now();
   if (now - user.lastGameAt < 1000) {
-    return res.status(400).json({
-      success: false,
-      error: 'Please wait before starting another game'
-    });
+    return res.status(400).json({ success: false, error: 'Please wait before starting another game' });
   }
 
-  // ── Check balance
+  // ── Balance check
   if (bet > user.balance) {
     return res.status(400).json({
       success: false,
@@ -169,14 +158,13 @@ app.post('/api/game/start', (req, res) => {
     });
   }
 
-  // ── Deduct bet
-  user.balance     -= bet;
+  // ── Deduct bet & create game
+  user.balance      -= bet;
   user.totalWagered += bet;
   user.gamesPlayed  += 1;
   user.lastGameAt    = now;
 
-  // ── Create game
-  const gameId = `${userId}-${now}-${Math.random().toString(36).slice(2, 7)}`;
+  const gameId     = `${userId}-${now}-${Math.random().toString(36).slice(2, 7)}`;
   const crashPoint = generateCrashPoint();
 
   const game = {
@@ -191,14 +179,14 @@ app.post('/api/game/start', (req, res) => {
   };
 
   games.set(gameId, game);
-  activeGames.set(userId, gameId); // Mark user as in-game
+  activeGames.set(userId, gameId);
 
   console.log(`🎮 Game started: ${userId} bet ${bet} | crash at ${crashPoint}x`);
 
   res.json({
     success: true,
     gameId,
-    crashPoint, // in production, don't send this! keep it secret
+    crashPoint, // ⚠️ remove in production!
     balance: user.balance
   });
 });
@@ -212,36 +200,18 @@ app.post('/api/game/cashout', (req, res) => {
   }
 
   const game = games.get(gameId);
+  if (!game)                  return res.status(400).json({ success: false, error: 'Game not found' });
+  if (game.userId !== userId) return res.status(403).json({ success: false, error: 'Not your game' });
+  if (game.status !== 'active') return res.status(400).json({ success: false, error: 'Game already ended' });
+  if (game.cashedOut)           return res.status(400).json({ success: false, error: 'Already cashed out!' });
 
-  // ── Game must exist
-  if (!game) {
-    return res.status(400).json({ success: false, error: 'Game not found' });
-  }
-
-  // ── Must belong to this user
-  if (game.userId !== userId) {
-    return res.status(403).json({ success: false, error: 'Not your game' });
-  }
-
-  // ── Game must be active
-  if (game.status !== 'active') {
-    return res.status(400).json({ success: false, error: 'Game already ended' });
-  }
-
-  // ── Prevent double cashout (KEY PROTECTION!)
-  if (game.cashedOut) {
-    return res.status(400).json({ success: false, error: 'Already cashed out!' });
-  }
-
-  // ── Lock game immediately to prevent race conditions
+  // Lock immediately
   game.cashedOut = true;
-  game.status = 'completed';
+  game.status    = 'completed';
 
   const cashMult = parseFloat(multiplier);
 
-  // ── Check if crashed before cashout
   if (cashMult > game.crashPoint) {
-    // Too late! Crashed
     activeGames.delete(userId);
     return res.json({
       success: false,
@@ -251,33 +221,50 @@ app.post('/api/game/cashout', (req, res) => {
     });
   }
 
-  // ── Validate multiplier is reasonable
   if (cashMult < 1.00 || cashMult > 20) {
     activeGames.delete(userId);
     return res.status(400).json({ success: false, error: 'Invalid multiplier' });
   }
 
-  // ── Pay out winnings
-  const user = getUser(userId);
+  const user      = getUser(userId);
   const winAmount = parseFloat((game.betAmount * cashMult).toFixed(2));
 
   user.balance += winAmount;
   user.totalWon += winAmount;
-
   game.cashoutMultiplier = cashMult;
-  activeGames.delete(userId); // Free user to play again
+  activeGames.delete(userId);
 
   console.log(`💰 Cashout: ${userId} won ${winAmount} at ${cashMult}x`);
 
-  res.json({
-    success: true,
-    winAmount,
-    multiplier: cashMult,
-    balance: user.balance
-  });
+  res.json({ success: true, winAmount, multiplier: cashMult, balance: user.balance });
 });
 
-// ── WITHDRAW ──────────────────────────────────
+// ── CRASH REPORT ─────────────────────────────
+// ✅ NEW ENDPOINT — frontend calls this when the plane crashes naturally.
+// This clears the active game so the user can bet again next round.
+app.post('/api/game/crash', (req, res) => {
+  const { userId, gameId } = req.body;
+
+  if (!userId || !gameId) {
+    return res.status(400).json({ success: false, error: 'Invalid request' });
+  }
+
+  const game = games.get(gameId);
+
+  if (game && game.userId === userId && game.status === 'active') {
+    game.status    = 'crashed';
+    game.cashedOut = false;
+    activeGames.delete(userId);
+    console.log(`💥 Crash reported: ${userId} at game ${gameId}`);
+  } else {
+    // Game may already be cleaned up — still clear activeGames to be safe
+    activeGames.delete(userId);
+  }
+
+  res.json({ success: true });
+});
+
+// ── WITHDRAW ─────────────────────────────────
 app.post('/api/withdraw', (req, res) => {
   const { userId, amount } = req.body;
 
@@ -285,7 +272,7 @@ app.post('/api/withdraw', (req, res) => {
     return res.status(400).json({ success: false, error: 'Invalid request' });
   }
 
-  const user = getUser(userId);
+  const user           = getUser(userId);
   const withdrawAmount = parseFloat(amount);
 
   if (withdrawAmount > user.balance) {
@@ -295,31 +282,22 @@ app.post('/api/withdraw', (req, res) => {
     });
   }
 
-  // Block withdraw if in active game
   if (activeGames.has(userId)) {
-    return res.status(400).json({
-      success: false,
-      error: 'Cannot withdraw during an active game!'
-    });
+    return res.status(400).json({ success: false, error: 'Cannot withdraw during an active game!' });
   }
 
   user.balance -= withdrawAmount;
-
   console.log(`⬆️ Withdraw: ${userId} withdrew ${withdrawAmount}`);
 
-  res.json({
-    success: true,
-    balance: user.balance,
-    withdrawn: withdrawAmount
-  });
+  res.json({ success: true, balance: user.balance, withdrawn: withdrawAmount });
 });
 
 // ── STATS ─────────────────────────────────────
 app.get('/api/stats', (req, res) => {
-  const totalUsers = users.size;
-  const totalGames = Array.from(users.values()).reduce((s, u) => s + u.gamesPlayed, 0);
-  const totalWagered = Array.from(users.values()).reduce((s, u) => s + u.totalWagered, 0);
-  const totalWon = Array.from(users.values()).reduce((s, u) => s + u.totalWon, 0);
+  const totalUsers    = users.size;
+  const totalGames    = Array.from(users.values()).reduce((s, u) => s + u.gamesPlayed, 0);
+  const totalWagered  = Array.from(users.values()).reduce((s, u) => s + u.totalWagered, 0);
+  const totalWon      = Array.from(users.values()).reduce((s, u) => s + u.totalWon, 0);
 
   res.json({
     success: true,
@@ -337,15 +315,11 @@ setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
 
-  // Remove games older than 30 minutes
   for (const [id, game] of games.entries()) {
     if (now - game.startedAt > 30 * 60 * 1000) {
       games.delete(id);
-
-      // Also clean up active game if it got stuck
       if (activeGames.get(game.userId) === id) {
         const user = getUser(game.userId);
-        // Refund stuck bets
         if (game.status === 'active') {
           user.balance += game.betAmount;
           console.log(`♻️ Refunded stuck bet for ${game.userId}`);
@@ -356,13 +330,12 @@ setInterval(() => {
     }
   }
 
-  // Clean old rate limit entries
   for (const [id, entry] of requestLog.entries()) {
     if (now > entry.resetAt) requestLog.delete(id);
   }
 
   if (cleaned > 0) console.log(`🧹 Cleaned ${cleaned} old games`);
-}, 10 * 60 * 1000); // Every 10 minutes
+}, 10 * 60 * 1000);
 
 // ============================================
 // START
@@ -371,7 +344,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔══════════════════════════════════════╗
 ║   👻 GHOSTSTEIN AVIATOR BACKEND     ║
-║   Bulletproof Edition v2.0          ║
+║   Bulletproof Edition v2.1          ║
 ╚══════════════════════════════════════╝
 
 🚀 Port: ${PORT}
@@ -381,6 +354,8 @@ app.listen(PORT, '0.0.0.0', () => {
    ✅ 1 second cooldown between games
    ✅ Double cashout prevention
    ✅ Balance validation
+   ✅ Auto-clear stale games (60s)
+   ✅ Crash reporting endpoint
    ✅ Auto-cleanup every 10 min
   `);
 });
